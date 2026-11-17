@@ -1,0 +1,996 @@
+{
+  "name": "HubSpot Commission Clawback & Churn Reconciliation (Safe-by-Default)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Commission Clawback & Churn Reconciliation\n\n**Safe by default.** With no env vars this runs in **SANDBOX_MODE** on a synthetic fixture (portal 99000001): zero network calls, no files written, no CRM updates. CSVs appear only as **DRAFT** binaries in the execution.\n\nGo-live needs explicit opt-ins:\n`SANDBOX_MODE=false` · `DRY_RUN=false` · `CSV_EXPORT_ENABLED=true` · then `HUBSPOT_MUTATIONS_ENABLED=true` (stamps only after a successful export).\n\nFail-closed: incomplete search, pending-review deals, FX gaps and amount guards block the export. Secrets only via `$env`. See README.md.",
+        "height": 340,
+        "width": 560,
+        "color": 4
+      },
+      "id": "7a49bd3e-4010-4627-ac01-b221f7cafda7",
+      "name": "Safety Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -480,
+        -460
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "60d2ae96-7b6f-468e-ae37-3b78c8167e64",
+      "name": "Manual Test Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -460,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "hubspot-clawback-reconciliation",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "09c633fd-c1d3-4f3d-a8a4-dca1d5524047",
+      "name": "Reconciliation Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -460,
+        120
+      ],
+      "webhookId": "e3ede9b1-a8b1-4d48-a1cf-0bc7ca24fdee",
+      "notes": "POST {\"period\":\"YYYY-MM\"} with header x-reconciliation-secret (required in live mode)."
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "23 4 3 * *"
+            }
+          ]
+        }
+      },
+      "id": "d981e96e-25fd-4ff9-a59e-448f219135cf",
+      "name": "Monthly Schedule (3rd, 04:23)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -460,
+        300
+      ],
+      "notes": "Runs for the previous calendar month. Ships inactive."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Config & Safety Gate\n// Env-only configuration with fail-safe flags, reconciliation-period\n// resolution, and webhook authentication (secret checked here, then the\n// header and query string are stripped from item data).\n//\n//   * Safe-ON  (SANDBOX_MODE, DRY_RUN, BLOCK_EXPORT_ON_PENDING_REVIEW) turn OFF\n//     only on an explicit false/0/no/off.\n//   * Safe-OFF (CSV_EXPORT_ENABLED, HUBSPOT_MUTATIONS_ENABLED, ...) turn ON only\n//     on an explicit true/1/yes/on. Typos keep the safe value.\n//   * Blocked $env access => all safe defaults.\n// ============================================================================\nconst TRUTHY = ['true', '1', 'yes', 'on'];\nconst FALSY = ['false', '0', 'no', 'off'];\nlet envBlocked = false;\nfunction readEnv(key) {\n  try {\n    const v = $env[key];\n    return v === undefined || v === null ? '' : String(v).trim();\n  } catch (e) {\n    envBlocked = true;\n    return '';\n  }\n}\nconst str = (k, d = '') => readEnv(k) || d;\nconst safeOn = (k) => !FALSY.includes(readEnv(k).toLowerCase());\nconst safeOff = (k) => TRUTHY.includes(readEnv(k).toLowerCase());\nconst list = (k, d = '') => (readEnv(k) || d).split(',').map((s) => s.trim()).filter(Boolean);\nconst prop = (k, d) => (readEnv(k) || d).replace(/[^a-z0-9_]/gi, '');\nconst DECIMAL_RE = /^\\d+(\\.\\d+)?$/;\nconst configErrors = [];\nconst warnings = [];\nconst intIn = (k, d, min, max) => {\n  const raw = readEnv(k);\n  if (raw === '') return d;\n  const n = Number(raw);\n  if (!Number.isInteger(n) || n < min || n > max) { configErrors.push(`${k} must be an integer between ${min} and ${max} (got \"${raw}\")`); return d; }\n  return n;\n};\nconst decIn = (k, d) => {\n  const raw = readEnv(k).replace(/[,_\\s]/g, '');\n  if (raw === '') return d;\n  if (!DECIMAL_RE.test(raw)) { configErrors.push(`${k} must be a non-negative decimal (got \"${readEnv(k)}\")`); return d; }\n  return raw;\n};\n\nconst sandboxMode = safeOn('SANDBOX_MODE');\nconst dryRun = safeOn('DRY_RUN');\nconst csvExportEnabled = safeOff('CSV_EXPORT_ENABLED');\nconst hubspotMutationsEnabled = safeOff('HUBSPOT_MUTATIONS_ENABLED');\nconst hasHubspotToken = readEnv('HUBSPOT_ACCESS_TOKEN') !== '';\nconst hasWebhookSecret = readEnv('WEBHOOK_SHARED_SECRET').length >= 16;\n\nconst SYNTHETIC_PORTAL_ID = '99000001';\nconst configuredPortalId = str('HUBSPOT_PORTAL_ID');\nconst portalId = sandboxMode ? SYNTHETIC_PORTAL_ID : configuredPortalId;\nif (!sandboxMode) {\n  const problems = [];\n  if (!hasHubspotToken) problems.push('HUBSPOT_ACCESS_TOKEN is not set');\n  if (!/^\\d{1,12}$/.test(configuredPortalId)) problems.push('HUBSPOT_PORTAL_ID must be a numeric HubSpot portal ID');\n  if (problems.length) throw new Error('Live mode (SANDBOX_MODE=false) refused: ' + problems.join('; ') + '. Fix the variables or keep SANDBOX_MODE=true.');\n}\n\nconst now = (() => {\n  const o = str('NOW_OVERRIDE');\n  return o && !Number.isNaN(Date.parse(o)) ? new Date(o) : new Date();\n})();\n\n// ---- Trigger payload & webhook auth ----------------------------------------\nfunction constantTimeEqual(a, b) {\n  const x = String(a || '');\n  const y = String(b || '');\n  const len = Math.max(x.length, y.length);\n  let diff = x.length ^ y.length;\n  for (let i = 0; i < len; i++) diff |= (x.charCodeAt(i) || 0) ^ (y.charCodeAt(i) || 0);\n  return diff === 0 && x.length > 0;\n}\nconst SENSITIVE = new Set(['x-reconciliation-secret', 'authorization', 'cookie', 'proxy-authorization']);\nconst raw = $input.first().json || {};\nconst isWebhook = raw && typeof raw === 'object' && 'body' in raw && 'headers' in raw;\nlet requestedPeriod = '';\nif (isWebhook) {\n  const headers = Object.fromEntries(Object.entries(raw.headers || {}).map(([k, v]) => [String(k).toLowerCase(), v]));\n  const query = raw.query && typeof raw.query === 'object' ? raw.query : {};\n  const provided = headers['x-reconciliation-secret'] !== undefined ? headers['x-reconciliation-secret'] : query.reconciliation_secret;\n  const valid = hasWebhookSecret && constantTimeEqual(provided, readEnv('WEBHOOK_SHARED_SECRET'));\n  if (!sandboxMode && !valid) {\n    throw new Error('Webhook rejected: WEBHOOK_SHARED_SECRET (16+ chars) must be set and sent as header x-reconciliation-secret (or ?reconciliation_secret=).');\n  }\n  const b = raw.body && typeof raw.body === 'object' ? raw.body : {};\n  if (b.period !== undefined) requestedPeriod = String(b.period).trim();\n}\nconst SAFE_TRIGGER = isWebhook ? { kind: 'webhook', headers: Object.keys(raw.headers || {}).filter((k) => !SENSITIVE.has(String(k).toLowerCase())) } : { kind: 'manual-or-schedule' };\n\n// ---- Reconciliation period (YYYY-MM, UTC) ------------------------------------\nconst PERIOD_RE = /^(\\d{4})-(0[1-9]|1[0-2])$/;\nlet period = requestedPeriod || str('RECONCILIATION_PERIOD');\nlet periodSource = requestedPeriod ? 'webhook' : period ? 'env' : 'default-previous-month';\nif (!period) {\n  const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));\n  period = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;\n}\nconst pm = period.match(PERIOD_RE);\nif (!pm) throw new Error(`Invalid reconciliation period \"${period}\" (${periodSource}); expected YYYY-MM.`);\nconst periodStartMs = Date.UTC(Number(pm[1]), Number(pm[2]) - 1, 1);\nconst periodEndMs = Date.UTC(Number(pm[1]), Number(pm[2]), 1);\nif (periodStartMs > now.getTime()) throw new Error(`Reconciliation period ${period} is in the future.`);\nconst periodOpen = periodEndMs > now.getTime();\nif (periodOpen) warnings.push(`Period ${period} has not ended yet; churn recorded later this month will be missed by this run.`);\n\n// ---- Clawback policy ----------------------------------------------------------\nconst windowDays = intIn('CLAWBACK_WINDOW_DAYS', 90, 1, 730);\nconst policy = str('CLAWBACK_POLICY', 'linear').toLowerCase();\nif (!['linear', 'tiered', 'full'].includes(policy)) configErrors.push(`CLAWBACK_POLICY must be linear, tiered or full (got \"${policy}\")`);\nconst tiers = [];\nfor (const t of list('CLAWBACK_TIERS', '30:1,60:0.5,90:0.25')) {\n  const m = t.match(/^(\\d{1,4}):(\\d+(?:\\.\\d+)?)$/);\n  if (!m || Number(m[2]) > 1) { configErrors.push(`CLAWBACK_TIERS entry \"${t}\" must be <maxDays>:<rate 0..1>`); continue; }\n  tiers.push({ maxDays: Number(m[1]), rate: m[2] });\n}\ntiers.sort((a, b) => a.maxDays - b.maxDays);\nif (policy === 'tiered' && (!tiers.length || tiers[tiers.length - 1].maxDays > windowDays)) {\n  configErrors.push('CLAWBACK_TIERS must be non-empty and no tier may exceed CLAWBACK_WINDOW_DAYS');\n}\n\n// ---- Currency & FX ------------------------------------------------------------\nconst payrollCurrency = str('PAYROLL_CURRENCY', 'USD').toUpperCase();\nif (!/^[A-Z]{3}$/.test(payrollCurrency)) configErrors.push('PAYROLL_CURRENCY must be a 3-letter ISO code');\nconst fxRates = {};\nfor (const pair of list('FX_RATES')) {\n  const m = pair.match(/^([A-Z]{3}):(\\d+(?:\\.\\d{1,10})?)$/i);\n  if (!m || Number(m[2]) <= 0) { configErrors.push(`FX_RATES entry \"${pair}\" must be CCY:rate (rate > 0, up to 10 decimals)`); continue; }\n  fxRates[m[1].toUpperCase()] = m[2];\n}\nconst fxAsOf = str('FX_RATES_AS_OF');\nif (fxAsOf && !/^\\d{4}-\\d{2}-\\d{2}$/.test(fxAsOf)) configErrors.push('FX_RATES_AS_OF must be YYYY-MM-DD');\n\n// ---- Gates --------------------------------------------------------------------\nconst exportBlockers = [];\nif (sandboxMode) exportBlockers.push('SANDBOX_MODE=true (synthetic fixture run)');\nif (dryRun) exportBlockers.push('DRY_RUN=true');\nif (!csvExportEnabled) exportBlockers.push('CSV_EXPORT_ENABLED is not true');\nif (envBlocked) exportBlockers.push('n8n blocked $env access');\nif (configErrors.length) exportBlockers.push(`${configErrors.length} configuration error(s)`);\n\nconst stampBlockers = [];\nif (sandboxMode) stampBlockers.push('SANDBOX_MODE=true');\nif (dryRun) stampBlockers.push('DRY_RUN=true');\nif (!hubspotMutationsEnabled) stampBlockers.push('HUBSPOT_MUTATIONS_ENABLED is not true');\nif (!csvExportEnabled) stampBlockers.push('Deals are only stamped after a successful CSV export (CSV_EXPORT_ENABLED is not true)');\nif (envBlocked) stampBlockers.push('n8n blocked $env access');\nif (configErrors.length) stampBlockers.push(`${configErrors.length} configuration error(s)`);\n\nconst props = {\n  churnDate: prop('CHURN_DATE_PROPERTY', 'churn_date'),\n  contractStart: prop('CONTRACT_START_PROPERTY', 'contract_start_date'),\n  sdrOwner: prop('SDR_OWNER_PROPERTY', 'sdr_owner_id'),\n  aeCommissionPaid: prop('AE_COMMISSION_PAID_PROPERTY', 'ae_commission_paid'),\n  sdrCommissionPaid: prop('SDR_COMMISSION_PAID_PROPERTY', 'sdr_commission_paid'),\n  exempt: prop('CLAWBACK_EXEMPT_PROPERTY', 'clawback_exempt'),\n  stampStatus: prop('STAMP_STATUS_PROPERTY', 'clawback_status'),\n  stampAe: prop('STAMP_AE_AMOUNT_PROPERTY', 'clawback_ae_amount'),\n  stampSdr: prop('STAMP_SDR_AMOUNT_PROPERTY', 'clawback_sdr_amount'),\n  stampReconciliationId: prop('STAMP_RECONCILIATION_ID_PROPERTY', 'clawback_reconciliation_id'),\n  stampProcessedAt: prop('STAMP_PROCESSED_AT_PROPERTY', 'clawback_processed_at'),\n};\nconst closedWonStage = prop('CLOSED_WON_STAGE', 'closedwon');\nconst closedLostStage = prop('CLOSED_LOST_STAGE', 'closedlost');\nconst dealProperties = [...new Set([\n  'dealname', 'amount', 'deal_currency_code', 'closedate', 'dealstage', 'pipeline', 'hubspot_owner_id', 'hs_object_id',\n  `hs_date_entered_${closedWonStage}`, `hs_date_entered_${closedLostStage}`, ...Object.values(props),\n])];\n\nconst repPayrollRefs = {};\nfor (const pair of list('REP_PAYROLL_REF_MAP')) {\n  const m = pair.match(/^(\\d{1,20}):([A-Za-z0-9._-]{1,40})$/);\n  if (m) repPayrollRefs[m[1]] = m[2];\n  else warnings.push(`REP_PAYROLL_REF_MAP entry ignored (expected ownerId:REF): ${pair.slice(0, 40)}`);\n}\n\nconst config = {\n  runId: 'clb-' + now.toISOString().replace(/[-:.TZ]/g, '').slice(0, 14) + '-' + Math.random().toString(36).slice(2, 8),\n  now: now.toISOString(),\n  envBlocked,\n  sandboxMode,\n  dryRun,\n  portalId,\n  trigger: SAFE_TRIGGER,\n  period: { id: period, source: periodSource, startMs: periodStartMs, endMs: periodEndMs, startIso: new Date(periodStartMs).toISOString(), endIso: new Date(periodEndMs).toISOString(), open: periodOpen },\n  clawback: {\n    windowDays,\n    windowInclusive: safeOn('CLAWBACK_WINDOW_INCLUSIVE'),\n    anchor: str('CLAWBACK_WINDOW_ANCHOR', 'contract_start').toLowerCase() === 'close_date' ? 'close_date' : 'contract_start',\n    policy,\n    tiers,\n    retainCollectedCash: safeOff('CLAWBACK_RETAIN_COLLECTED_CASH'),\n    minAmount: decIn('CLAWBACK_MIN_AMOUNT', '1.00'),\n    detectClosedLostChurn: safeOn('DETECT_CLOSED_LOST_CHURN'),\n  },\n  commission: {\n    source: str('COMMISSION_SOURCE', 'recorded_only').toLowerCase() === 'recorded_then_computed' ? 'recorded_then_computed' : 'recorded_only',\n    aeRate: decIn('AE_COMMISSION_RATE', '0.10'),\n    sdrRate: decIn('SDR_COMMISSION_RATE', '0.02'),\n  },\n  currency: {\n    payroll: payrollCurrency,\n    portalDefault: str('PORTAL_DEFAULT_CURRENCY', 'USD').toUpperCase(),\n    fxRates,\n    fxAsOf: fxAsOf || null,\n  },\n  guards: {\n    maxTotal: decIn('MAX_TOTAL_CLAWBACK', '50000'),\n    maxSingle: decIn('MAX_SINGLE_ADJUSTMENT', '15000'),\n    blockOnPendingReview: safeOn('BLOCK_EXPORT_ON_PENDING_REVIEW'),\n    requirePayrollRef: safeOff('REQUIRE_PAYROLL_REF'),\n  },\n  hubspot: {\n    apiBase: str('HUBSPOT_API_BASE_URL', 'https://api.hubapi.com').replace(/\\/+$/, ''),\n    hasToken: hasHubspotToken,\n    closedWonStage,\n    closedLostStage,\n    props,\n    dealProperties,\n    invoicesEnabled: safeOn('INVOICE_COLLECTION_ENABLED'),\n    searchPageSize: intIn('HUBSPOT_SEARCH_PAGE_SIZE', 200, 10, 200),\n    maxSearchPages: 50,\n    mutationsEnabled: hubspotMutationsEnabled,\n    stampAllowed: stampBlockers.length === 0,\n    stampBlockers,\n  },\n  export: {\n    enabled: csvExportEnabled,\n    allowedByConfig: exportBlockers.length === 0,\n    blockers: exportBlockers,\n    dir: str('CSV_EXPORT_DIR', '/home/node/.n8n-files/clawback-exports').replace(/\\/+$/, ''),\n    includeDealName: safeOff('CSV_INCLUDE_DEAL_NAME'),\n    utf8Bom: safeOff('CSV_UTF8_BOM'),\n  },\n  repPayrollRefs,\n  configErrors,\n  warnings,\n};\nif (/\\.\\.|[\\0]/.test(config.export.dir)) configErrors.push('CSV_EXPORT_DIR must not contain \"..\" or NUL');\n\nconst safetyDecisions = [\n  `Mode: ${sandboxMode ? 'SANDBOX (synthetic fixture, zero network calls)' : 'LIVE (read-only HubSpot search + batch reads)'}`,\n  `Period: ${period} (${periodSource})${periodOpen ? ' [OPEN]' : ''}`,\n  `Policy: ${policy}, window ${windowDays} days (${config.clawback.windowInclusive ? 'inclusive' : 'exclusive'}), anchor ${config.clawback.anchor}`,\n  `CSV export: ${config.export.allowedByConfig ? 'ARMED (subject to guards)' : 'BLOCKED'}`,\n  `HubSpot stamp: ${config.hubspot.stampAllowed ? 'ARMED (after export)' : 'BLOCKED'}`,\n  `Commission source: ${config.commission.source}`,\n];\nreturn [{ json: { config, safetyDecisions } }];\n"
+      },
+      "id": "8ed04bb9-008f-48f2-afd7-0681900088a7",
+      "name": "Config & Safety Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -220,
+        120
+      ],
+      "notes": "Env-only config, fail-safe flags, period resolution, webhook auth."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "e02c7331-af23-4b45-a3c8-8f3fdb28a8c1",
+              "leftValue": "={{ $('Config & Safety Gate').first().json.config.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "69a50985-7a65-47d5-a2bd-ece2f8c83447",
+      "name": "Sandbox Mode?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        20,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Load Synthetic Churn Fixture  (SANDBOX_MODE=true path - ZERO network calls)\n// Embedded object = sample-payloads/closed-lost-churn-fixture.json (the\n// simulator verifies they are identical).\n// ============================================================================\nconst FIXTURE = {\n  \"_meta\": {\n    \"synthetic\": true,\n    \"fixtureVersion\": \"1.0.0\",\n    \"description\": \"Fully synthetic HubSpot deal + invoice records for offline clawback testing. Every company, deal, owner ID, payroll reference and amount is fictional. No real employees, customers, bank or payroll details. Record shapes mirror HubSpot CRM v3 search results (id + properties) and invoice batch reads.\",\n    \"placeholderPortalId\": \"99000001\",\n    \"reconciliationPeriod\": \"2026-10\",\n    \"expectedWithDefaults\": {\n      \"990010001\": \"CLAWBACK day 21 (AE + SDR, linear 69/90)\",\n      \"990010002\": \"CLAWBACK day 60 (AE only, linear 30/90; deal name tests CSV formula-injection guard)\",\n      \"990010003\": \"CLAWBACK day 89 boundary (linear 1/90)\",\n      \"990010004\": \"Day 90 inclusive boundary: linear rate 0 -> BELOW_DE_MINIMIS\",\n      \"990010005\": \"OUTSIDE_WINDOW day 141\",\n      \"990010006\": \"CLAWBACK day 45, EUR -> USD via synthetic FX\",\n      \"990010007\": \"CLAWBACK day 10, JPY (zero-decimal currency) -> USD\",\n      \"990010008\": \"PENDING_REVIEW: CHF has no FX rate\",\n      \"990010009\": \"CLAWBACK day 46, churn detected from closed-lost stage move (no churn_date)\",\n      \"990010010\": \"EXEMPT (clawback_exempt=true)\",\n      \"990010011\": \"SKIP_ALREADY_RECONCILED (reconciliation ID already stamped)\",\n      \"990010012\": \"PENDING_REVIEW: malformed recorded commission\",\n      \"990010013\": \"PENDING_REVIEW: churn date before contract start\",\n      \"990010014\": \"PENDING_REVIEW: missing AE owner\",\n      \"990010015\": \"AE NO_COMMISSION_PAID + SDR CLAWBACK day 50; contract start stored as epoch ms\",\n      \"990010016\": \"AE CLAWBACK day 21; SDR PENDING_REVIEW (no recorded SDR commission)\"\n    }\n  },\n  \"portalId\": \"99000001\",\n  \"sandboxFx\": {\n    \"payrollCurrency\": \"USD\",\n    \"asOf\": \"2026-10-31\",\n    \"rates\": {\n      \"EUR\": \"1.08\",\n      \"GBP\": \"1.27\",\n      \"JPY\": \"0.0067\"\n    }\n  },\n  \"sandboxRepPayrollRefs\": {\n    \"99100001\": \"EMP-SYN-0001\",\n    \"99200001\": \"EMP-SYN-0101\",\n    \"99200002\": \"EMP-SYN-0102\"\n  },\n  \"deals\": [\n    {\n      \"id\": \"990010001\",\n      \"properties\": {\n        \"hs_object_id\": \"990010001\",\n        \"dealname\": \"Acme Enterprise Corp - Platform (Mock)\",\n        \"amount\": \"95000\",\n        \"deal_currency_code\": \"USD\",\n        \"dealstage\": \"closedwon\",\n        \"pipeline\": \"default\",\n        \"closedate\": \"2026-09-05T16:00:00.000Z\",\n        \"hs_date_entered_closedwon\": \"2026-09-05T16:00:00.000Z\",\n        \"contract_start_date\": \"2026-09-10\",\n        \"churn_date\": \"2026-10-01\",\n        \"hubspot_owner_id\": \"99100001\",\n        \"sdr_owner_id\": \"99200001\",\n        \"ae_commission_paid\": \"9500.00\",\n        \"sdr_commission_paid\": \"1900.00\",\n        \"clawback_exempt\": \"false\",\n        \"clawback_reconciliation_id\": \"\"\n      }\n    },\n    {\n      \"id\": \"990010002\",\n      \"properties\": {\n        \"hs_object_id\": \"990010002\",\n        \"dealname\": \"=HYPERLINK(\\\"https://example.com\\\",\\\"Northstar Renewal (Mock)\\\")\",\n        \"amount\": \"60000.00\",\n        \"deal_currency_code\": \"USD\",\n        \"dealstage\": \"closedwon\",\n        \"pipeline\": \"default\",\n        \"closedate\": \"2026-08-10T16:00:00.000Z\",\n        \"hs_date_entered_closedwon\": \"2026-08-10T16:00:00.000Z\",\n        \"contract_start_date\": \"2026-08-12\",\n        \"churn_date\": \"2026-10-11\",\n        \"hubspot_owner_id\": \"99100002\",\n        \"sdr_owner_id\": \"\",\n        \"ae_commission_paid\": \"6000\",\n        \"sdr_commission_paid\": \"\"\n      }\n    },\n    {\n      \"id\": \"990010003\",\n      \"properties\": {\n        \"hs_object_id\": \"990010003\",\n        \"dealname\": \"Bluebird Analytics - Pro (Mock)\",\n        \"amount\": \"45000\",\n        \"deal_currency_code\": \"USD\",\n        \"dealstage\": \"closedwon\",\n        \"closedate\": \"2026-07-14T16:00:00.000Z\",\n        \"contract_start_date\": \"2026-07-15\",\n        \"churn_date\": \"2026-10-12\",\n        \"hubspot_owner_id\": \"99100001\",\n        \"sdr_owner_id\": \"99200002\",\n        \"ae_commission_paid\": \"4500\",\n        \"sdr_commission_paid\": \"900\"\n      }\n    },\n    {\n      \"id\": \"990010004\",\n      \"properties\": {\n        \"hs_object_id\": \"990010004\",\n        \"dealname\": \"Pinecrest Media - Growth (Mock)\",\n        \"amount\": \"30000\",\n        \"deal_currency_code\": \"USD\",\n        \"dealstage\": \"closedwon\",\n        \"closedate\": \"2026-07-14T16:00:00.000Z\",\n        \"contract_start_date\": \"2026-07-15\",\n        \"churn_date\": \"2026-10-13\",\n        \"hubspot_owner_id\": \"99100002\",\n        \"ae_commission_paid\": \"3000\"\n      }\n    },\n    {\n      \"id\": \"990010005\",\n      \"properties\": {\n        \"hs_object_id\": \"990010005\",\n        \"dealname\": \"Harborview Freight - Enterprise (Mock)\",\n        \"amount\": \"50000\",\n        \"deal_currency_code\": \"USD\",\n        \"dealstage\": \"closedwon\",\n        \"closedate\": \"2026-05-29T16:00:00.000Z\",\n        \"contract_start_date\": \"2026-06-01\",\n        \"churn_date\": \"2026-10-20\",\n        \"hubspot_owner_id\": \"99100001\",\n        \"sdr_owner_id\": \"99200001\",\n        \"ae_commission_paid\": \"5000\",\n        \"sdr_commission_paid\": \"1000\"\n      }\n    },\n    {\n      \"id\": \"990010006\",\n      \"properties\": {\n        \"hs_object_id\": \"990010006\",\n        \"dealname\": \"Zurich Cafe Systems AG - POS (Mock)\",\n        \"amount\": \"72000\",\n        \"deal_currency_code\": \"EUR\",\n        \"dealstage\": \"closedwon\",\n        \"closedate\": \"2026-08-28T16:00:00.000Z\",\n        \"contract_start_date\": \"2026-09-01\",\n        \"churn_date\": \"2026-10-16\",\n        \"hubspot_owner_id\": \"99100001\",\n        \"sdr_owner_id\": \"99200002\",\n        \"ae_commission_paid\": \"7200.00\",\n        \"sdr_commission_paid\": \"1440.00\"\n      }\n    },\n    {\n      \"id\": \"990010007\",\n      \"properties\": {\n        \"hs_object_id\": \"990010007\",\n        \"dealname\": \"Sakura Logistics KK - Starter (Mock)\",\n        \"amount\": \"3000000\",\n        \"deal_currency_code\": \"JPY\",\n        \"dealstage\": \"closedwon\",\n        \"closedate\": \"2026-09-20T03:00:00.000Z\",\n        \"contract_start_date\": \"2026-09-25\",\n        \"churn_date\": \"2026-10-05\",\n        \"hubspot_owner_id\": \"99100002\",\n        \"ae_commission_paid\": \"300000\"\n      }\n    },\n    {\n      \"id\": \"990010008\",\n      \"properties\": {\n        \"hs_object_id\": \"990010008\",\n        \"dealname\": \"Alpine Ledger SA - Core (Mock)\",\n        \"amount\": \"40000\",\n        \"deal_currency_code\": \"CHF\",\n        \"dealstage\": \"closedwon\",\n        \"closedate\": \"2026-08-30T16:00:00.000Z\",\n        \"contract_start_date\": \"2026-09-01\",\n        \"churn_date\": \"2026-10-08\",\n        \"hubspot_owner_id\": \"99100001\",\n        \"ae_commission_paid\": \"4000\"\n      }\n    },\n    {\n      \"id\": \"990010009\",\n      \"properties\": {\n        \"hs_object_id\": \"990010009\",\n        \"dealname\": \"Granite Robotics - Pilot (Mock)\",\n        \"amount\": \"25000\",\n        \"deal_currency_code\": \"USD\",\n        \"dealstage\": \"closedlost\",\n        \"closedate\": \"2026-10-05T10:00:00.000Z\",\n        \"hs_date_entered_closedwon\": \"2026-08-20T15:30:00.000Z\",\n        \"hs_date_entered_closedlost\": \"2026-10-05T10:00:00.000Z\",\n        \"contract_start_date\": \"\",\n        \"churn_date\": \"\",\n        \"hubspot_owner_id\": \"99100001\",\n        \"sdr_owner_id\": \"99200001\",\n        \"ae_commission_paid\": \"2500\",\n        \"sdr_commission_paid\": \"500\"\n      }\n    },\n    {\n      \"id\": \"990010010\",\n      \"properties\": {\n        \"hs_object_id\": \"990010010\",\n        \"dealname\": \"Lakeside Health - Exempt (Mock)\",\n        \"amount\": \"80000\",\n        \"deal_currency_code\": \"USD\",\n        \"dealstage\": \"closedwon\",\n        \"closedate\": \"2026-09-01T16:00:00.000Z\",\n        \"contract_start_date\": \"2026-09-02\",\n        \"churn_date\": \"2026-10-03\",\n        \"hubspot_owner_id\": \"99100002\",\n        \"ae_commission_paid\": \"8000\",\n        \"clawback_exempt\": \"true\"\n      }\n    },\n    {\n      \"id\": \"990010011\",\n      \"properties\": {\n        \"hs_object_id\": \"990010011\",\n        \"dealname\": \"Meridian Retail - Reconciled (Mock)\",\n        \"amount\": \"20000\",\n        \"deal_currency_code\": \"USD\",\n        \"dealstage\": \"closedwon\",\n        \"closedate\": \"2026-08-01T16:00:00.000Z\",\n        \"contract_start_date\": \"2026-08-03\",\n        \"churn_date\": \"2026-10-02\",\n        \"hubspot_owner_id\": \"99100001\",\n        \"ae_commission_paid\": \"2000\",\n        \"clawback_reconciliation_id\": \"REC-2026-10-0000000000\"\n      }\n    },\n    {\n      \"id\": \"990010012\",\n      \"properties\": {\n        \"hs_object_id\": \"990010012\",\n        \"dealname\": \"Orbit Labs - Bad Data (Mock)\",\n        \"amount\": \"12k\",\n        \"deal_currency_code\": \"USD\",\n        \"dealstage\": \"closedwon\",\n        \"closedate\": \"2026-09-10T16:00:00.000Z\",\n        \"contract_start_date\": \"2026-09-12\",\n        \"churn_date\": \"2026-10-09\",\n        \"hubspot_owner_id\": \"99100002\",\n        \"ae_commission_paid\": \"9,5OO\"\n      }\n    },\n    {\n      \"id\": \"990010013\",\n      \"properties\": {\n        \"hs_object_id\": \"990010013\",\n        \"dealname\": \"Cobalt Systems - Date Error (Mock)\",\n        \"amount\": \"15000\",\n        \"deal_currency_code\": \"USD\",\n        \"dealstage\": \"closedwon\",\n        \"closedate\": \"2026-10-20T16:00:00.000Z\",\n        \"contract_start_date\": \"2026-10-25\",\n        \"churn_date\": \"2026-10-18\",\n        \"hubspot_owner_id\": \"99100001\",\n        \"ae_commission_paid\": \"1500\"\n      }\n    },\n    {\n      \"id\": \"990010014\",\n      \"properties\": {\n        \"hs_object_id\": \"990010014\",\n        \"dealname\": \"Ember Foods - No Owner (Mock)\",\n        \"amount\": \"18000\",\n        \"deal_currency_code\": \"USD\",\n        \"dealstage\": \"closedwon\",\n        \"closedate\": \"2026-09-15T16:00:00.000Z\",\n        \"contract_start_date\": \"2026-09-15\",\n        \"churn_date\": \"2026-10-10\",\n        \"hubspot_owner_id\": \"\",\n        \"ae_commission_paid\": \"1800\"\n      }\n    },\n    {\n      \"id\": \"990010015\",\n      \"properties\": {\n        \"hs_object_id\": \"990010015\",\n        \"dealname\": \"Quartz Mobility - SDR Only (Mock)\",\n        \"amount\": \"20000\",\n        \"deal_currency_code\": \"USD\",\n        \"dealstage\": \"closedwon\",\n        \"closedate\": \"2026-09-01T16:00:00.000Z\",\n        \"contract_start_date\": \"1788393600000\",\n        \"churn_date\": \"2026-10-23\",\n        \"hubspot_owner_id\": \"99100002\",\n        \"sdr_owner_id\": \"99200002\",\n        \"ae_commission_paid\": \"0\",\n        \"sdr_commission_paid\": \"400\"\n      }\n    },\n    {\n      \"id\": \"990010016\",\n      \"properties\": {\n        \"hs_object_id\": \"990010016\",\n        \"dealname\": \"Velvet Peak Apparel - Missing SDR (Mock)\",\n        \"amount\": \"40000\",\n        \"deal_currency_code\": \"USD\",\n        \"dealstage\": \"closedwon\",\n        \"closedate\": \"2026-09-08T16:00:00.000Z\",\n        \"contract_start_date\": \"2026-09-10\",\n        \"churn_date\": \"2026-10-01\",\n        \"hubspot_owner_id\": \"99100001\",\n        \"sdr_owner_id\": \"99200001\",\n        \"ae_commission_paid\": \"4000\",\n        \"sdr_commission_paid\": \"\"\n      }\n    }\n  ],\n  \"invoicesByDeal\": {\n    \"990010001\": [\n      {\n        \"id\": \"990020001\",\n        \"properties\": {\n          \"hs_invoice_status\": \"paid\",\n          \"hs_amount_billed\": \"23750.00\",\n          \"hs_balance_due\": \"0\",\n          \"hs_currency\": \"USD\"\n        }\n      },\n      {\n        \"id\": \"990020002\",\n        \"properties\": {\n          \"hs_invoice_status\": \"open\",\n          \"hs_amount_billed\": \"23750.00\",\n          \"hs_balance_due\": \"23750.00\",\n          \"hs_currency\": \"USD\"\n        }\n      }\n    ],\n    \"990010006\": [\n      {\n        \"id\": \"990020003\",\n        \"properties\": {\n          \"hs_invoice_status\": \"paid\",\n          \"hs_amount_billed\": \"18000.00\",\n          \"hs_balance_due\": \"0\",\n          \"hs_currency\": \"EUR\"\n        }\n      },\n      {\n        \"id\": \"990020004\",\n        \"properties\": {\n          \"hs_invoice_status\": \"voided\",\n          \"hs_amount_billed\": \"18000.00\",\n          \"hs_balance_due\": \"18000.00\",\n          \"hs_currency\": \"EUR\"\n        }\n      }\n    ]\n  }\n};\n\nreturn [{\n  json: {\n    source: 'synthetic-fixture',\n    complete: true,\n    deals: FIXTURE.deals,\n    invoicesByDeal: FIXTURE.invoicesByDeal,\n    invoiceLookup: 'ok',\n    sandboxFx: FIXTURE.sandboxFx,\n    sandboxRepPayrollRefs: FIXTURE.sandboxRepPayrollRefs,\n    collectionWarnings: [],\n  },\n}];\n"
+      },
+      "id": "7423c431-de17-4c8b-a2fd-0c4ed02660cc",
+      "name": "Load Synthetic Churn Fixture",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Build Churned-Deal Search  (LIVE path)\n// One read-only CRM search (POST /crm/v3/objects/deals/search) with up to two\n// OR'ed filter groups:\n//   A. churn_date within the reconciliation period\n//   B. (optional) deals now in the closed-lost stage that entered it during the\n//      period AND have a recorded closed-won entry date (\"closed-lost churn\")\n// Sorted by hs_object_id for stable pagination; the HTTP node pages with `after`.\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\nconst h = config.hubspot;\nconst startMs = String(config.period.startMs);\nconst endMs = String(config.period.endMs);\nconst filterGroups = [\n  { filters: [\n    { propertyName: h.props.churnDate, operator: 'GTE', value: startMs },\n    { propertyName: h.props.churnDate, operator: 'LT', value: endMs },\n  ] },\n];\nif (config.clawback.detectClosedLostChurn) {\n  filterGroups.push({ filters: [\n    { propertyName: 'dealstage', operator: 'EQ', value: h.closedLostStage },\n    { propertyName: `hs_date_entered_${h.closedLostStage}`, operator: 'GTE', value: startMs },\n    { propertyName: `hs_date_entered_${h.closedLostStage}`, operator: 'LT', value: endMs },\n    { propertyName: `hs_date_entered_${h.closedWonStage}`, operator: 'HAS_PROPERTY' },\n  ] },\n  );\n}\nconst body = {\n  filterGroups,\n  properties: h.dealProperties,\n  sorts: [{ propertyName: 'hs_object_id', direction: 'ASCENDING' }],\n  limit: h.searchPageSize,\n};\nif (JSON.stringify(body).length > 3000) throw new Error('Search request exceeds HubSpot\\'s 3,000-character limit; shorten the configured property names.');\nreturn [{ json: { url: `${h.apiBase}/crm/v3/objects/deals/search`, body } }];\n"
+      },
+      "id": "82001a06-5cbb-4cce-a936-d7a6891cabfc",
+      "name": "Build Churned-Deal Search",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 30000,
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "body",
+                    "name": "after",
+                    "value": "={{ $response.body.paging && $response.body.paging.next ? $response.body.paging.next.after : undefined }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.paging || !$response.body.paging.next || !$response.body.paging.next.after }}",
+              "limitPagesFetched": true,
+              "maxRequests": 50,
+              "requestInterval": 300
+            }
+          }
+        }
+      },
+      "id": "37c46734-c2f2-4bd4-af64-34017d9581a3",
+      "name": "HubSpot: Search Churned Deals",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        300
+      ],
+      "notes": "Read-only CRM search, 200 per page, <= 50 pages (HubSpot caps search at 10,000 results). Stops the run on failure: no partial payroll file.",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Collect Search Pages  (LIVE path) - FAIL CLOSED\n// Any failed page, a result set above HubSpot's 10,000-result search cap, or\n// pagination stopped by the page limit aborts the run: a payroll file built\n// from partial data would be silently wrong.\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\nconst pages = $input.all().map((i) => i.json);\nconst failed = pages.find((p) => p && p.error);\nif (failed) throw new Error('HubSpot deal search failed; aborting (no partial reconciliation): ' + String(failed.error.message || failed.error).slice(0, 300));\nconst total = pages.length && typeof pages[0].total === 'number' ? pages[0].total : null;\nif (total !== null && total >= 10000) {\n  throw new Error(`HubSpot search matched ${total} deals; the search API cannot page past 10,000. Narrow the period or filters.`);\n}\nconst last = pages[pages.length - 1] || {};\nif (pages.length >= config.hubspot.maxSearchPages && last.paging && last.paging.next) {\n  throw new Error(`Search pagination stopped at ${pages.length} pages with more results pending; aborting to avoid an incomplete reconciliation.`);\n}\nconst seen = new Map();\nfor (const p of pages) for (const r of p.results || []) if (r && r.id && !seen.has(String(r.id))) seen.set(String(r.id), r);\nconst deals = [...seen.values()];\nconst warnings = [];\nif (total !== null && total !== deals.length) warnings.push(`Search reported total=${total} but ${deals.length} unique deals were collected (records may have changed during paging).`);\nreturn [{ json: { source: 'hubspot-api', complete: true, deals, dealCount: deals.length, pages: pages.length, collectionWarnings: warnings } }];\n"
+      },
+      "id": "249e7bdb-749e-4e71-a414-c247f192b79b",
+      "name": "Collect Search Pages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        300
+      ],
+      "notes": "Fail closed on errors, >10k results or truncated pagination."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "a6d53fc5-ebe2-403d-a383-4a447fe1b4a4",
+              "leftValue": "={{ $('Config & Safety Gate').first().json.config.hubspot.invoicesEnabled && $json.dealCount > 0 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e97dc291-e376-4360-aeeb-de7b6d0706d5",
+      "name": "Invoice Lookup Needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        920,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Build Invoice Association Requests  (LIVE path)\n// v4 batch association read (read-only POST), 100 deal IDs per request.\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\nconst { deals } = $input.first().json;\nconst ids = deals.map((d) => String(d.id));\nconst out = [];\nfor (let i = 0; i < ids.length; i += 100) {\n  out.push({ json: { url: `${config.hubspot.apiBase}/crm/v4/associations/deals/invoices/batch/read`, body: { inputs: ids.slice(i, i + 100).map((id) => ({ id })) } } });\n}\nreturn out;\n"
+      },
+      "id": "91465691-40d5-4051-af4d-fd04e6e52f51",
+      "name": "Build Invoice Association Requests",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1140,
+        440
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "7780bd76-ebde-476e-a354-aa7dcc24c6fb",
+      "name": "HubSpot: Deal→Invoice Associations",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1360,
+        440
+      ],
+      "notes": "v4 batch association read (read-only).",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Build Invoice Read Requests  (LIVE path)\n// Turns association responses into a deal->invoice map and batch-read\n// requests (100 invoices each). Emits {skip:true} when there is nothing to read.\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\nconst responses = $input.all().map((i) => i.json);\nconst assocMap = {};\nlet assocFailed = null;\nfor (const r of responses) {\n  if (r.error) { assocFailed = String(r.error.message || r.error).slice(0, 300); continue; }\n  for (const row of r.results || []) {\n    const from = String(row.from && row.from.id);\n    assocMap[from] = (row.to || []).map((t) => String(t.toObjectId));\n  }\n}\nconst invoiceIds = [...new Set(Object.values(assocMap).flat())];\nif (assocFailed || !invoiceIds.length) return [{ json: { skip: true, assocMap, assocFailed } }];\nconst out = [];\nfor (let i = 0; i < invoiceIds.length; i += 100) {\n  out.push({ json: {\n    skip: false, assocMap, assocFailed: null,\n    url: `${config.hubspot.apiBase}/crm/v3/objects/invoices/batch/read`,\n    body: { inputs: invoiceIds.slice(i, i + 100).map((id) => ({ id })), properties: ['hs_invoice_status', 'hs_amount_billed', 'hs_balance_due', 'hs_currency'] },\n  } });\n}\nreturn out;\n"
+      },
+      "id": "ee95ef8e-559d-4515-a6ff-7ef3f20c3839",
+      "name": "Build Invoice Read Requests",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1580,
+        440
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "05087786-5316-4dea-a3c2-0ac143d84963",
+              "leftValue": "={{ $json.skip !== true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e5409d06-1074-45da-af98-8b4b161c92b9",
+      "name": "Invoice Reads Needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1800,
+        440
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "682811c6-8d90-4da9-aaca-fd30c5766c98",
+      "name": "HubSpot: Read Invoices",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2020,
+        560
+      ],
+      "notes": "Batch read (read-only POST).",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Normalize Deal Records\n// Unifies the sandbox fixture and the live search (+ optional invoices) into\n// one shape: { records: [{ deal, invoices, invoiceLookup }], fx, repPayrollRefs }.\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\nconst first = $input.first().json || {};\nconst warnings = [];\nlet deals;\nlet invoicesByDeal = {};\nlet invoiceLookup = 'disabled';\nlet source;\n\nif (first.source === 'synthetic-fixture') {\n  source = first.source;\n  deals = first.deals;\n  invoicesByDeal = first.invoicesByDeal || {};\n  invoiceLookup = 'ok';\n} else {\n  const search = $('Collect Search Pages').first().json;\n  source = search.source;\n  deals = search.deals;\n  warnings.push(...search.collectionWarnings);\n  if (config.hubspot.invoicesEnabled && deals.length) {\n    let plan = null;\n    try { plan = $('Build Invoice Read Requests').first().json; } catch (e) { plan = null; }\n    if (!plan) invoiceLookup = 'failed';\n    else if (plan.assocFailed) { invoiceLookup = 'failed'; warnings.push('Invoice associations could not be read: ' + plan.assocFailed); }\n    else {\n      invoiceLookup = 'ok';\n      const byId = {};\n      if (!plan.skip) {\n        for (const r of $input.all().map((i) => i.json)) {\n          if (r.error) { invoiceLookup = 'failed'; warnings.push('Invoice batch read failed: ' + String(r.error.message || r.error).slice(0, 200)); continue; }\n          for (const inv of r.results || []) byId[String(inv.id)] = inv;\n        }\n      }\n      for (const [dealId, ids] of Object.entries(plan.assocMap || {})) invoicesByDeal[dealId] = ids.map((id) => byId[id]).filter(Boolean);\n    }\n  }\n}\n\n// FX + payroll refs: env first; sandbox falls back to the fixture's synthetic values.\nlet fx = { rates: config.currency.fxRates, asOf: config.currency.fxAsOf, source: 'env' };\nlet repPayrollRefs = config.repPayrollRefs;\nif (config.sandboxMode) {\n  if (!Object.keys(fx.rates).length && first.sandboxFx) fx = { rates: first.sandboxFx.rates, asOf: first.sandboxFx.asOf, source: 'fixture' };\n  if (!Object.keys(repPayrollRefs).length && first.sandboxRepPayrollRefs) repPayrollRefs = first.sandboxRepPayrollRefs;\n}\n\nconst records = deals.map((d) => ({ deal: { id: String(d.id), properties: d.properties || {} }, invoices: invoicesByDeal[String(d.id)] || [], invoiceLookup }));\nreturn [{ json: { source, complete: true, records, fx, repPayrollRefs, invoiceLookup, collectionWarnings: warnings } }];\n"
+      },
+      "id": "33dd870a-cf71-4885-a9da-f575706bc2bd",
+      "name": "Normalize Deal Records",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2240,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Clawback Calculator  (pure computation, no network)\n// For every churned deal:\n//   1. Idempotency / exemption / data-quality checks (each with a reason code)\n//   2. Churn date (churn_date property, or closed-lost stage entry) and window\n//      anchor (contract start -> closed-won entry -> close date), UTC days\n//   3. Clawback rate from the policy (linear | tiered | full) as an exact fraction\n//   4. Per role (AE, SDR): recorded (or computed) commission, FX to the payroll\n//      currency, optional collected-cash retention, de-minimis threshold\n//   5. Totals, deterministic adjustment / reconciliation IDs, export guards\n// Money is handled as BigInt minor units with a single half-up rounding per\n// step; no floating-point amounts are ever summed.\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\nconst input = $input.first().json;\nconst C = config.clawback;\nconst P = config.hubspot.props;\nconst DAY = 86400000;\n\n// ---- Pure-JS SHA-256 (no require; identical to node:crypto output)\nfunction utf8Bytes(str) {\n  const out = [];\n  for (let i = 0; i < str.length; i++) {\n    let c = str.charCodeAt(i);\n    if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {\n      const d = str.charCodeAt(i + 1);\n      if (d >= 0xdc00 && d <= 0xdfff) { c = 0x10000 + ((c - 0xd800) << 10) + (d - 0xdc00); i++; }\n    }\n    if (c < 0x80) out.push(c);\n    else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));\n    else if (c < 0x10000) out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));\n    else out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));\n  }\n  return out;\n}\n\nfunction sha256(str) {\n  const K = [\n    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,\n    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,\n    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,\n    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,\n    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,\n    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,\n    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,\n    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,\n  ];\n  const H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];\n  const bytes = utf8Bytes(str);\n  const bitLen = bytes.length * 8;\n  bytes.push(0x80);\n  while (bytes.length % 64 !== 56) bytes.push(0);\n  const hi = Math.floor(bitLen / 0x100000000);\n  const lo = bitLen >>> 0;\n  bytes.push((hi >>> 24) & 255, (hi >>> 16) & 255, (hi >>> 8) & 255, hi & 255);\n  bytes.push((lo >>> 24) & 255, (lo >>> 16) & 255, (lo >>> 8) & 255, lo & 255);\n  const W = new Array(64);\n  const rotr = (x, n) => (x >>> n) | (x << (32 - n));\n  for (let off = 0; off < bytes.length; off += 64) {\n    for (let t = 0; t < 16; t++) {\n      const j = off + t * 4;\n      W[t] = ((bytes[j] << 24) | (bytes[j + 1] << 16) | (bytes[j + 2] << 8) | bytes[j + 3]) >>> 0;\n    }\n    for (let t = 16; t < 64; t++) {\n      const s0 = rotr(W[t - 15], 7) ^ rotr(W[t - 15], 18) ^ (W[t - 15] >>> 3);\n      const s1 = rotr(W[t - 2], 17) ^ rotr(W[t - 2], 19) ^ (W[t - 2] >>> 10);\n      W[t] = (W[t - 16] + s0 + W[t - 7] + s1) >>> 0;\n    }\n    let [a, b, c, d, e, f, g, h] = H;\n    for (let t = 0; t < 64; t++) {\n      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);\n      const ch = (e & f) ^ (~e & g);\n      const t1 = (h + S1 + ch + K[t] + W[t]) >>> 0;\n      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);\n      const maj = (a & b) ^ (a & c) ^ (b & c);\n      const t2 = (S0 + maj) >>> 0;\n      h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;\n    }\n    H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;\n    H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0; H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;\n  }\n  return H.map((x) => x.toString(16).padStart(8, '0')).join('');\n}\n\n// ---------------------------------------------------------------- money\nconst ZERO_DP = new Set(['JPY', 'KRW', 'CLP', 'VND', 'ISK', 'UGX', 'XAF', 'XOF', 'PYG', 'RWF']);\nconst THREE_DP = new Set(['KWD', 'BHD', 'OMR', 'JOD', 'TND', 'LYD', 'IQD']);\nconst dpOf = (ccy) => (ZERO_DP.has(ccy) ? 0 : THREE_DP.has(ccy) ? 3 : 2);\nconst pow10 = (n) => 10n ** BigInt(n);\nconst roundDiv = (num, den) => (num * 2n + den) / (den * 2n); // half-up, num >= 0, den > 0\n/** Strict decimal parser -> { ok, minor (BigInt) } ; accepts 1234.56 or 1,234.56 */\nfunction parseMoney(raw, dp) {\n  if (raw === null || raw === undefined) return { ok: false, empty: true };\n  const s = String(raw).trim();\n  if (s === '') return { ok: false, empty: true };\n  if (!/^(\\d+|\\d{1,3}(,\\d{3})+)(\\.\\d+)?$/.test(s)) return { ok: false, empty: false };\n  const [intPart, frac = ''] = s.replace(/,/g, '').split('.');\n  const scale = frac.length;\n  const asInt = BigInt(intPart + frac);\n  const minor = scale <= dp ? asInt * pow10(dp - scale) : roundDiv(asInt, pow10(scale - dp));\n  return { ok: true, minor };\n}\n/** Decimal string -> exact fraction {num, den} */\nfunction frac(dec) {\n  const [i, f = ''] = String(dec).split('.');\n  return { num: BigInt(i + f), den: pow10(f.length) };\n}\nfunction fmt(minor, dp, negative = false) {\n  const m = minor < 0n ? -minor : minor;\n  const s = m.toString().padStart(dp + 1, '0');\n  const body = dp ? `${s.slice(0, -dp)}.${s.slice(-dp)}` : s;\n  return (negative || minor < 0n) && m !== 0n ? `-${body}` : body;\n}\n// Display-only ratio, rounded half-up (money math never uses this value).\nconst ratio = (num, den, places = 6) => (den === 0n ? '0' : (Number(roundDiv(num * pow10(places), den)) / 10 ** places).toFixed(places));\n\n// ---------------------------------------------------------------- dates\nfunction parseDay(raw) {\n  if (raw === null || raw === undefined) return { ok: false, empty: true };\n  const s = String(raw).trim();\n  if (s === '') return { ok: false, empty: true };\n  let ms = NaN;\n  if (/^\\d{4}-\\d{2}-\\d{2}$/.test(s)) {\n    const [y, m, d] = s.split('-').map(Number);\n    ms = Date.UTC(y, m - 1, d);\n    if (new Date(ms).getUTCDate() !== d) ms = NaN; // rejects 2026-02-30\n  } else if (/^\\d{12,14}$/.test(s)) ms = Number(s);\n  else if (/^\\d{4}-\\d{2}-\\d{2}T/.test(s)) ms = Date.parse(s);\n  if (!Number.isFinite(ms) || ms < Date.UTC(1990, 0, 1) || ms > Date.UTC(2100, 0, 1)) return { ok: false, empty: false };\n  const day = Math.floor(ms / DAY);\n  return { ok: true, day, iso: new Date(day * DAY).toISOString().slice(0, 10) };\n}\nconst truthy = (v) => ['true', '1', 'yes'].includes(String(v ?? '').trim().toLowerCase());\n\n// ---------------------------------------------------------------- policy\nfunction clawbackRate(days) {\n  const inWindow = C.windowInclusive ? days <= C.windowDays : days < C.windowDays;\n  if (!inWindow) return null;\n  if (C.policy === 'full') return { num: 1n, den: 1n };\n  if (C.policy === 'tiered') {\n    const tier = C.tiers.find((t) => days <= t.maxDays);\n    return tier ? frac(tier.rate) : { num: 0n, den: 1n };\n  }\n  return { num: BigInt(Math.max(0, C.windowDays - days)), den: BigInt(C.windowDays) };\n}\n\n// ---------------------------------------------------------------- setup\nconst payCcy = config.currency.payroll;\nconst payDp = dpOf(payCcy);\nconst minClaw = parseMoney(C.minAmount, payDp).minor;\nconst maxSingle = parseMoney(config.guards.maxSingle, payDp).minor;\nconst maxTotal = parseMoney(config.guards.maxTotal, payDp).minor;\nconst fxRates = (input.fx && input.fx.rates) || {};\nconst refs = input.repPayrollRefs || {};\nconst periodStartDay = Math.floor(config.period.startMs / DAY);\nconst periodEndDay = Math.floor(config.period.endMs / DAY);\nconst todayDay = Math.floor(Date.parse(config.now) / DAY);\nconst wonKey = `hs_date_entered_${config.hubspot.closedWonStage}`;\nconst lostKey = `hs_date_entered_${config.hubspot.closedLostStage}`;\n\nconst rows = [];\nconst deals = [];\nconst fxUsed = new Set();\nconst pendingIssues = [];\n\nfor (const rec of input.records) {\n  const p = rec.deal.properties || {};\n  const dealId = rec.deal.id;\n  const dealName = String(p.dealname || '');\n  const dealOut = { dealId, dealName, status: null, reasonCode: null, notes: [] };\n  const finish = (status, reasonCode, note) => { dealOut.status = status; dealOut.reasonCode = reasonCode; if (note) dealOut.notes.push(note); deals.push(dealOut); };\n\n  if (String(p[P.stampReconciliationId] || '').trim()) { finish('SKIP_ALREADY_RECONCILED', 'RECONCILIATION_ID_PRESENT', `Already in ${String(p[P.stampReconciliationId]).slice(0, 40)}`); continue; }\n  if (truthy(p[P.exempt])) { finish('EXEMPT', 'CLAWBACK_EXEMPT_FLAG'); continue; }\n\n  // Churn date & source\n  let churn = parseDay(p[P.churnDate]);\n  let churnSource = 'churn_date_property';\n  if (!churn.ok && !churn.empty) { finish('PENDING_REVIEW', 'INVALID_CHURN_DATE', `${P.churnDate}=\"${String(p[P.churnDate]).slice(0, 30)}\"`); continue; }\n  if (churn.empty) {\n    const lost = parseDay(p[lostKey]);\n    const won = parseDay(p[wonKey]);\n    if (C.detectClosedLostChurn && String(p.dealstage) === config.hubspot.closedLostStage && lost.ok && won.ok) { churn = lost; churnSource = 'closed_lost_stage'; }\n    else { finish('NOT_CHURNED', 'NO_CHURN_SIGNAL'); continue; }\n  }\n  if (churn.day < periodStartDay || churn.day >= periodEndDay) { finish('OUT_OF_PERIOD', 'CHURN_OUTSIDE_PERIOD', `churn ${churn.iso}`); continue; }\n  if (churn.day > todayDay) { finish('NOT_YET_EFFECTIVE', 'CHURN_IN_FUTURE', `churn ${churn.iso}`); continue; }\n\n  // Window anchor\n  let anchor = null;\n  let anchorSource = null;\n  const candidates = C.anchor === 'contract_start' ? [[P.contractStart, 'contract_start'], [wonKey, 'closed_won_entered'], ['closedate', 'close_date']] : [[wonKey, 'closed_won_entered'], ['closedate', 'close_date']];\n  let anchorError = null;\n  for (const [key, label] of candidates) {\n    const d = parseDay(p[key]);\n    if (d.ok) { anchor = d; anchorSource = label; break; }\n    if (!d.empty && !anchorError) anchorError = `${key}=\"${String(p[key]).slice(0, 30)}\"`;\n  }\n  if (!anchor) { finish('PENDING_REVIEW', anchorError ? 'INVALID_ANCHOR_DATE' : 'MISSING_ANCHOR_DATE', anchorError); continue; }\n  if (anchorError && anchorSource !== 'contract_start' && C.anchor === 'contract_start' && String(p[P.contractStart] || '').trim()) {\n    finish('PENDING_REVIEW', 'INVALID_CONTRACT_START', anchorError); continue;\n  }\n  const daysActive = churn.day - anchor.day;\n  if (daysActive < 0) { finish('PENDING_REVIEW', 'CHURN_BEFORE_ANCHOR', `churn ${churn.iso} < ${anchorSource} ${anchor.iso}`); continue; }\n  const rate = clawbackRate(daysActive);\n  if (!rate) { finish('OUTSIDE_WINDOW', 'BEYOND_CLAWBACK_WINDOW', `day ${daysActive} > ${C.windowDays}`); continue; }\n\n  // Currency, amount, collected cash\n  const ccyRaw = String(p.deal_currency_code || '').trim().toUpperCase();\n  const dealCcy = ccyRaw || config.currency.portalDefault;\n  if (!ccyRaw) dealOut.notes.push(`deal_currency_code empty; assumed ${dealCcy}`);\n  const dealDp = dpOf(dealCcy);\n  const amount = parseMoney(p.amount, dealDp);\n  let fx = null;\n  if (dealCcy === payCcy) fx = { rate: '1', num: 1n, den: 1n };\n  else if (fxRates[dealCcy]) { fx = { rate: fxRates[dealCcy], ...frac(fxRates[dealCcy]) }; fxUsed.add(dealCcy); }\n\n  let collected = { num: 1n, den: 1n, display: '' };\n  let collectedIssue = null;\n  if (C.retainCollectedCash) {\n    if (rec.invoiceLookup !== 'ok') collectedIssue = 'INVOICE_DATA_UNAVAILABLE';\n    else if (!amount.ok || amount.minor === 0n) collectedIssue = 'INVALID_DEAL_AMOUNT';\n    else {\n      let paid = 0n;\n      for (const inv of rec.invoices || []) {\n        const ip = inv.properties || {};\n        const st = String(ip.hs_invoice_status || '').toLowerCase();\n        if (st === 'voided' || st === 'draft') continue;\n        const invCcy = String(ip.hs_currency || dealCcy).toUpperCase();\n        if (invCcy !== dealCcy) { collectedIssue = 'INVOICE_CURRENCY_MISMATCH'; break; }\n        const billed = parseMoney(ip.hs_amount_billed, dealDp);\n        const due = parseMoney(ip.hs_balance_due || '0', dealDp);\n        if (!billed.ok || !due.ok) { collectedIssue = 'INVALID_INVOICE_AMOUNT'; break; }\n        if (billed.minor > due.minor) paid += billed.minor - due.minor;\n      }\n      if (paid > amount.minor) paid = amount.minor;\n      collected = { num: amount.minor - paid, den: amount.minor, display: ratio(paid, amount.minor, 4) };\n    }\n  }\n\n  // Roles\n  const roles = [];\n  const aeId = String(p.hubspot_owner_id || '').trim();\n  roles.push({ role: 'AE', ownerId: aeId, paidKey: P.aeCommissionPaid, rateDec: config.commission.aeRate });\n  const sdrId = String(p[P.sdrOwner] || '').trim();\n  if (sdrId) roles.push({ role: 'SDR', ownerId: sdrId, paidKey: P.sdrCommissionPaid, rateDec: config.commission.sdrRate });\n\n  for (const r of roles) {\n    const row = {\n      adjustmentId: 'ADJ-' + sha256(`${config.period.id}|${dealId}|${r.role}|${r.ownerId}`).slice(0, 16).toUpperCase(),\n      dealId, dealName, role: r.role, repOwnerId: r.ownerId, repPayrollRef: refs[r.ownerId] || '',\n      anchorDate: anchor.iso, anchorSource, churnDate: churn.iso, churnSource, daysActive, windowDays: C.windowDays,\n      policy: C.policy, clawbackRate: ratio(rate.num, rate.den), collectedRatio: collected.display,\n      commissionSource: '', originalCommission: '', originalCurrency: dealCcy, fxRate: fx ? fx.rate : '',\n      commissionPayroll: '', clawbackAmount: '', clawbackMinor: 0, payrollCurrency: payCcy,\n      status: 'CLAWBACK', reasonCode: '', notes: [...dealOut.notes],\n    };\n    const pend = (code, note) => { row.status = 'PENDING_REVIEW'; row.reasonCode = code; if (note) row.notes.push(note); };\n    rows.push(row);\n    if (!/^\\d{1,20}$/.test(r.ownerId)) { pend(r.role === 'AE' ? 'MISSING_AE_OWNER' : 'INVALID_SDR_OWNER'); continue; }\n    if (collectedIssue) { pend(collectedIssue); continue; }\n    if (!fx) { pend('FX_RATE_MISSING', `No FX_RATES entry for ${dealCcy}->${payCcy}`); continue; }\n\n    let basis = parseMoney(p[r.paidKey], dealDp);\n    if (basis.ok) row.commissionSource = 'recorded';\n    else if (!basis.empty) { pend('INVALID_COMMISSION_AMOUNT', `${r.paidKey}=\"${String(p[r.paidKey]).slice(0, 30)}\"`); continue; }\n    else if (config.commission.source === 'recorded_then_computed') {\n      if (!amount.ok) { pend('INVALID_DEAL_AMOUNT', `amount=\"${String(p.amount ?? '').slice(0, 30)}\"`); continue; }\n      const rf = frac(r.rateDec);\n      basis = { ok: true, minor: roundDiv(amount.minor * rf.num, rf.den) };\n      row.commissionSource = `computed@${r.rateDec}`;\n      row.notes.push('Commission computed from rate; verify against the commission ledger');\n    } else { pend('MISSING_RECORDED_COMMISSION', `${r.paidKey} is empty`); continue; }\n    if (amount.ok && basis.minor > amount.minor) { pend('COMMISSION_EXCEEDS_DEAL_AMOUNT'); continue; }\n\n    row.originalCommission = fmt(basis.minor, dealDp);\n    const payMinor = roundDiv(basis.minor * fx.num * pow10(payDp), fx.den * pow10(dealDp));\n    row.commissionPayroll = fmt(payMinor, payDp);\n    if (payMinor === 0n) { row.status = 'NO_COMMISSION_PAID'; row.reasonCode = 'ZERO_COMMISSION'; row.clawbackAmount = fmt(0n, payDp); continue; }\n    const claw = roundDiv(payMinor * rate.num * collected.num, rate.den * collected.den);\n    row.clawbackMinor = Number(claw);\n    row.clawbackAmount = fmt(claw, payDp, true);\n    if (claw < minClaw) { row.status = 'BELOW_DE_MINIMIS'; row.reasonCode = 'BELOW_CLAWBACK_MIN_AMOUNT'; continue; }\n    if (!row.repPayrollRef) {\n      if (config.guards.requirePayrollRef) { pend('MISSING_PAYROLL_REF'); continue; }\n      row.notes.push('No payroll reference mapped for this rep');\n    }\n    if (claw > maxSingle) row.notes.push('EXCEEDS_MAX_SINGLE_ADJUSTMENT');\n  }\n\n  const own = rows.filter((x) => x.dealId === dealId);\n  if (own.some((x) => x.status === 'PENDING_REVIEW')) {\n    // Hold the whole deal: a valid AE row must not reach payroll while its SDR\n    // row (or vice versa) is unresolved, or a re-run could pay it twice.\n    for (const x of own) if (x.status === 'CLAWBACK') { x.status = 'HELD_DEAL_PENDING_REVIEW'; x.notes.push('Held until the deal\\'s other row is resolved'); }\n    finish('PENDING_REVIEW', own.find((x) => x.status === 'PENDING_REVIEW').reasonCode);\n  }\n  else if (own.some((x) => x.status === 'CLAWBACK')) finish('CLAWBACK', 'WITHIN_CLAWBACK_WINDOW', `day ${daysActive}/${C.windowDays}`);\n  else finish('NO_CLAWBACK_DUE', own.map((x) => x.reasonCode).join('+'), `day ${daysActive}/${C.windowDays}`);\n}\n\n// ---------------------------------------------------------------- totals\nconst claws = rows.filter((r) => r.status === 'CLAWBACK');\nconst sumMinor = claws.reduce((s, r) => s + BigInt(r.clawbackMinor), 0n);\nconst byRep = {};\nfor (const r of claws) {\n  const k = `${r.role}:${r.repOwnerId}`;\n  byRep[k] = byRep[k] || { role: r.role, repOwnerId: r.repOwnerId, repPayrollRef: r.repPayrollRef, adjustments: 0, minor: 0n };\n  byRep[k].adjustments++;\n  byRep[k].minor += BigInt(r.clawbackMinor);\n}\nconst repTotals = Object.values(byRep)\n  .sort((a, b) => (a.role === b.role ? a.repOwnerId.localeCompare(b.repOwnerId) : a.role.localeCompare(b.role)))\n  .map((t) => ({ role: t.role, repOwnerId: t.repOwnerId, repPayrollRef: t.repPayrollRef, adjustments: t.adjustments, total: fmt(t.minor, payDp, true) }));\nconst statusCounts = {};\nfor (const d of deals) statusCounts[d.status] = (statusCounts[d.status] || 0) + 1;\nconst rowStatusCounts = {};\nfor (const r of rows) rowStatusCounts[r.status] = (rowStatusCounts[r.status] || 0) + 1;\n\nconst fingerprint = [...claws.map((r) => `${r.adjustmentId}:${r.clawbackMinor}`), ...deals.map((d) => `${d.dealId}:${d.status}`)].sort().join('|');\nconst reconciliationId = `REC-${config.period.id}-${sha256(fingerprint).slice(0, 10).toUpperCase()}`;\n\n// ---------------------------------------------------------------- guards\nconst guardFailures = [];\nif (sumMinor > maxTotal) guardFailures.push(`Total clawback ${fmt(sumMinor, payDp)} ${payCcy} exceeds MAX_TOTAL_CLAWBACK ${config.guards.maxTotal}`);\nconst big = claws.filter((r) => BigInt(r.clawbackMinor) > maxSingle);\nif (big.length) guardFailures.push(`${big.length} adjustment(s) exceed MAX_SINGLE_ADJUSTMENT ${config.guards.maxSingle}: ${big.map((r) => r.adjustmentId).join(', ')}`);\nconst pendingDeals = deals.filter((d) => d.status === 'PENDING_REVIEW');\nif (pendingDeals.length && config.guards.blockOnPendingReview) guardFailures.push(`${pendingDeals.length} deal(s) need review (BLOCK_EXPORT_ON_PENDING_REVIEW=true)`);\nif (fxUsed.size && !input.fx.asOf) guardFailures.push(`FX conversion used (${[...fxUsed].join(', ')}) but FX_RATES_AS_OF is not set`);\nif (!input.complete) guardFailures.push('Data collection was incomplete');\nif (config.configErrors.length) guardFailures.push(...config.configErrors.map((e) => `Config: ${e}`));\n\nreturn [{\n  json: {\n    reconciliationId,\n    period: config.period.id,\n    payrollCurrency: payCcy,\n    policy: { policy: C.policy, windowDays: C.windowDays, inclusive: C.windowInclusive, anchor: C.anchor, tiers: C.tiers, retainCollectedCash: C.retainCollectedCash, minAmount: C.minAmount, commissionSource: config.commission.source },\n    fx: { ...input.fx, used: [...fxUsed] },\n    source: input.source,\n    invoiceLookup: input.invoiceLookup,\n    rows,\n    deals,\n    totals: { adjustments: claws.length, total: fmt(sumMinor, payDp, true), totalMinor: Number(sumMinor), byRep: repTotals },\n    statusCounts,\n    rowStatusCounts,\n    guards: { passed: guardFailures.length === 0, failures: guardFailures },\n    collectionWarnings: input.collectionWarnings || [],\n  },\n}];\n"
+      },
+      "id": "e751a5b1-16ef-4f75-a30d-de9e5153db17",
+      "name": "Clawback Calculator",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2460,
+        120
+      ],
+      "notes": "90-day window, linear/tiered/full policy, exact BigInt money math, FX, guards."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// CSV Builder & Integrity\n// Produces three files, each with a SHA-256 checksum:\n//   1. payroll CSV  - CLAWBACK adjustments only (negative amounts), import-ready\n//   2. audit CSV    - every evaluated deal / role with status and reason code\n//   3. manifest JSON - totals, per-rep totals, guards, checksums, policy snapshot\n// RFC 4180 quoting, CRLF line endings, and a formula-injection guard: any text\n// cell starting with = + - @ TAB or CR gets a leading apostrophe. Plain numbers\n// such as -1234.56 are left untouched.\n// Files are named DRAFT-... whenever export is not allowed.\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\nconst r = $input.first().json;\n\n// ---- Pure-JS SHA-256 (no require; identical to node:crypto output)\nfunction utf8Bytes(str) {\n  const out = [];\n  for (let i = 0; i < str.length; i++) {\n    let c = str.charCodeAt(i);\n    if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {\n      const d = str.charCodeAt(i + 1);\n      if (d >= 0xdc00 && d <= 0xdfff) { c = 0x10000 + ((c - 0xd800) << 10) + (d - 0xdc00); i++; }\n    }\n    if (c < 0x80) out.push(c);\n    else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));\n    else if (c < 0x10000) out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));\n    else out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));\n  }\n  return out;\n}\n\nfunction sha256(str) {\n  const K = [\n    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,\n    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,\n    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,\n    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,\n    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,\n    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,\n    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,\n    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,\n  ];\n  const H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];\n  const bytes = utf8Bytes(str);\n  const bitLen = bytes.length * 8;\n  bytes.push(0x80);\n  while (bytes.length % 64 !== 56) bytes.push(0);\n  const hi = Math.floor(bitLen / 0x100000000);\n  const lo = bitLen >>> 0;\n  bytes.push((hi >>> 24) & 255, (hi >>> 16) & 255, (hi >>> 8) & 255, hi & 255);\n  bytes.push((lo >>> 24) & 255, (lo >>> 16) & 255, (lo >>> 8) & 255, lo & 255);\n  const W = new Array(64);\n  const rotr = (x, n) => (x >>> n) | (x << (32 - n));\n  for (let off = 0; off < bytes.length; off += 64) {\n    for (let t = 0; t < 16; t++) {\n      const j = off + t * 4;\n      W[t] = ((bytes[j] << 24) | (bytes[j + 1] << 16) | (bytes[j + 2] << 8) | bytes[j + 3]) >>> 0;\n    }\n    for (let t = 16; t < 64; t++) {\n      const s0 = rotr(W[t - 15], 7) ^ rotr(W[t - 15], 18) ^ (W[t - 15] >>> 3);\n      const s1 = rotr(W[t - 2], 17) ^ rotr(W[t - 2], 19) ^ (W[t - 2] >>> 10);\n      W[t] = (W[t - 16] + s0 + W[t - 7] + s1) >>> 0;\n    }\n    let [a, b, c, d, e, f, g, h] = H;\n    for (let t = 0; t < 64; t++) {\n      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);\n      const ch = (e & f) ^ (~e & g);\n      const t1 = (h + S1 + ch + K[t] + W[t]) >>> 0;\n      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);\n      const maj = (a & b) ^ (a & c) ^ (b & c);\n      const t2 = (S0 + maj) >>> 0;\n      h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;\n    }\n    H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;\n    H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0; H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;\n  }\n  return H.map((x) => x.toString(16).padStart(8, '0')).join('');\n}\n\nconst NUMERIC = /^-?\\d+(\\.\\d+)?$/;\nfunction cell(v) {\n  let s = v === null || v === undefined ? '' : Array.isArray(v) ? v.join('; ') : String(v);\n  s = s.replace(/\\r\\n|\\r|\\n/g, ' ');\n  if (!NUMERIC.test(s) && /^[=+\\-@\\t]/.test(s)) s = \"'\" + s;\n  return /[\",]/.test(s) || /^\\s|\\s$/.test(s) ? `\"${s.replace(/\"/g, '\"\"')}\"` : s;\n}\nconst toCsv = (header, records) => (config.export.utf8Bom ? '﻿' : '') + [header, ...records].map((row) => row.map(cell).join(',')).join('\\r\\n') + '\\r\\n';\n\nconst includeName = config.export.includeDealName;\nconst payrollHeader = ['reconciliation_id', 'adjustment_id', 'period', 'rep_role', 'rep_hubspot_owner_id', 'rep_payroll_ref', 'deal_id', ...(includeName ? ['deal_name'] : []),\n  'anchor_date', 'anchor_source', 'churn_date', 'churn_source', 'days_active', 'window_days', 'clawback_policy', 'clawback_rate', 'collected_ratio',\n  'commission_source', 'original_commission', 'original_currency', 'fx_rate', 'commission_in_payroll_currency', 'clawback_amount', 'payroll_currency', 'notes'];\nconst payrollRows = r.rows.filter((x) => x.status === 'CLAWBACK').map((x) => [\n  r.reconciliationId, x.adjustmentId, r.period, x.role, x.repOwnerId, x.repPayrollRef, x.dealId, ...(includeName ? [x.dealName] : []),\n  x.anchorDate, x.anchorSource, x.churnDate, x.churnSource, x.daysActive, x.windowDays, x.policy, x.clawbackRate, x.collectedRatio,\n  x.commissionSource, x.originalCommission, x.originalCurrency, x.fxRate, x.commissionPayroll, x.clawbackAmount, x.payrollCurrency, x.notes,\n]);\n\nconst auditHeader = ['reconciliation_id', 'period', 'deal_id', ...(includeName ? ['deal_name'] : []), 'deal_status', 'deal_reason_code', 'adjustment_id', 'rep_role', 'rep_hubspot_owner_id',\n  'row_status', 'row_reason_code', 'anchor_date', 'churn_date', 'churn_source', 'days_active', 'clawback_rate', 'original_commission', 'original_currency', 'fx_rate', 'clawback_amount', 'payroll_currency', 'notes'];\nconst auditRows = [];\nfor (const d of r.deals) {\n  const own = r.rows.filter((x) => x.dealId === d.dealId);\n  if (!own.length) {\n    auditRows.push([r.reconciliationId, r.period, d.dealId, ...(includeName ? [d.dealName] : []), d.status, d.reasonCode, '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', d.notes]);\n    continue;\n  }\n  for (const x of own) {\n    auditRows.push([r.reconciliationId, r.period, d.dealId, ...(includeName ? [d.dealName] : []), d.status, d.reasonCode, x.adjustmentId, x.role, x.repOwnerId,\n      x.status, x.reasonCode, x.anchorDate, x.churnDate, x.churnSource, x.daysActive, x.clawbackRate, x.originalCommission, x.originalCurrency, x.fxRate,\n      x.status === 'CLAWBACK' ? x.clawbackAmount : '', x.payrollCurrency, x.notes]);\n  }\n}\n\nconst payrollCsv = toCsv(payrollHeader, payrollRows);\nconst auditCsv = toCsv(auditHeader, auditRows);\nconst exportBlockers = [...config.export.blockers, ...r.guards.failures];\nconst exportAllowed = exportBlockers.length === 0;\nconst prefix = exportAllowed ? '' : 'DRAFT-';\nconst base = `clawback-${r.period}-${r.reconciliationId}`;\nconst files = [\n  { kind: 'payroll', fileName: `${prefix}${base}-payroll.csv`, mimeType: 'text/csv', content: payrollCsv, rows: payrollRows.length },\n  { kind: 'audit', fileName: `${prefix}${base}-audit.csv`, mimeType: 'text/csv', content: auditCsv, rows: auditRows.length },\n];\nfor (const f of files) {\n  f.sha256 = sha256(f.content);\n  f.bytes = utf8Bytes(f.content).length;\n}\nconst manifest = {\n  schemaVersion: '1.0.0',\n  generator: 'n8n-hubspot-commission-clawback-churn-reconciliation-calculator',\n  reconciliationId: r.reconciliationId,\n  period: r.period,\n  generatedAt: config.now,\n  runId: config.runId,\n  source: r.source,\n  portalId: config.portalId,\n  exportAllowed,\n  exportBlockers,\n  payrollCurrency: r.payrollCurrency,\n  policy: r.policy,\n  fx: r.fx,\n  totals: r.totals,\n  dealStatusCounts: r.statusCounts,\n  rowStatusCounts: r.rowStatusCounts,\n  files: files.map((f) => ({ kind: f.kind, fileName: f.fileName, rows: f.rows, bytes: f.bytes, sha256: f.sha256 })),\n  collectionWarnings: r.collectionWarnings,\n};\nconst manifestContent = JSON.stringify(manifest, null, 2) + '\\n';\nfiles.push({ kind: 'manifest', fileName: `${prefix}${base}-manifest.json`, mimeType: 'application/json', content: manifestContent, rows: null, sha256: sha256(manifestContent), bytes: utf8Bytes(manifestContent).length });\n\nreturn files.map((f) => ({\n  json: {\n    kind: f.kind,\n    fileName: f.fileName,\n    path: `${config.export.dir}/${f.fileName}`,\n    rows: f.rows,\n    bytes: f.bytes,\n    sha256: f.sha256,\n    exportAllowed,\n    exportBlockers,\n    reconciliationId: r.reconciliationId,\n    content: f.content,\n  },\n  binary: {\n    data: { data: Buffer.from(f.content, 'utf8').toString('base64'), mimeType: f.mimeType, fileName: f.fileName, fileExtension: f.kind === 'manifest' ? 'json' : 'csv' },\n  },\n}));\n"
+      },
+      "id": "4c4970c0-f3bb-477c-a86b-56cb0a24627b",
+      "name": "CSV Builder & Integrity",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2680,
+        120
+      ],
+      "notes": "Payroll CSV + audit CSV + manifest, SHA-256, formula-injection guard."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "d0594b65-80cd-4415-ac27-9c91524516a6",
+              "leftValue": "={{ $json.exportAllowed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c1c8c584-11b7-4cf8-a976-7c5cb82c4bfc",
+      "name": "Export Allowed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2900,
+        120
+      ],
+      "notes": "Config gates AND guards (totals, pending review, FX as-of, completeness)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Dry-Run Preview  (export blocked)\n// Summarises the DRAFT files (downloadable from this execution's binary data)\n// and every reason the export and the HubSpot stamp were blocked.\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\nconst files = $input.all().map((i) => i.json);\nconst calc = $('Clawback Calculator').first().json;\nreturn [{\n  json: {\n    mode: 'dry-run',\n    reconciliationId: calc.reconciliationId,\n    exportBlockedBy: files[0] ? files[0].exportBlockers : [],\n    stampBlockedBy: config.hubspot.stampBlockers,\n    draftFiles: files.map((f) => ({ kind: f.kind, fileName: f.fileName, rows: f.rows, bytes: f.bytes, sha256: f.sha256 })),\n    wouldWriteTo: config.export.dir,\n    payrollPreview: (files.find((f) => f.kind === 'payroll') || {}).content || '',\n  },\n}];\n"
+      },
+      "id": "d67319aa-e745-41ef-a531-b3447cb37d25",
+      "name": "Dry-Run Preview",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "={{ $json.path }}",
+        "dataPropertyName": "data",
+        "options": {}
+      },
+      "id": "4c12e8a2-b9b6-4d8a-a0bb-819443845e7f",
+      "name": "Write CSV Files to Disk",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        3120,
+        -40
+      ],
+      "notes": "Writes to CSV_EXPORT_DIR. n8n must be allowed to write there (N8N_RESTRICT_FILE_ACCESS_TO)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Export Result\n// Confirms all three files were written (one item per file from the write\n// node). Anything less stops the run before any HubSpot stamp.\n// ============================================================================\nconst written = $input.all().map((i) => i.json);\nconst planned = $('CSV Builder & Integrity').all().map((i) => i.json);\nif (written.length !== planned.length) {\n  throw new Error(`Export incomplete: ${written.length}/${planned.length} files written. Deals were NOT stamped; fix the export target and re-run.`);\n}\nreturn [{\n  json: {\n    mode: 'exported',\n    reconciliationId: planned[0].reconciliationId,\n    files: planned.map((f) => ({ kind: f.kind, path: f.path, rows: f.rows, bytes: f.bytes, sha256: f.sha256 })),\n  },\n}];\n"
+      },
+      "id": "035d870b-a21d-4404-ad50-68ade8c43c17",
+      "name": "Export Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3340,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c3b79630-e6f9-4487-aa09-9b65476e0edf",
+              "leftValue": "={{ $('Config & Safety Gate').first().json.config.hubspot.stampAllowed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "0d66bf9a-1c93-44ea-af41-5528889d91a7",
+      "name": "HubSpot Stamp Allowed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3560,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Build Deal Stamp Batches  (after a successful export, stamping armed)\n// Stamps only conclusively evaluated deals; PENDING_REVIEW deals stay\n// unstamped so the next run re-evaluates them. 100 deals per batch update.\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\nconst calc = $('Clawback Calculator').first().json;\nconst P = config.hubspot.props;\nconst STAMPABLE = new Set(['CLAWBACK', 'NO_CLAWBACK_DUE', 'OUTSIDE_WINDOW', 'EXEMPT']);\nconst toAbs = (s) => String(s || '').replace(/^-/, '');\nconst inputs = [];\nfor (const d of calc.deals.filter((x) => STAMPABLE.has(x.status))) {\n  const rows = calc.rows.filter((r) => r.dealId === d.dealId && r.status === 'CLAWBACK');\n  const sum = (role) => rows.filter((r) => r.role === role).reduce((s, r) => s + r.clawbackMinor, 0);\n  const dp = (calc.totals.total.split('.')[1] || '').length;\n  const asDec = (minor) => (dp ? (minor / 10 ** dp).toFixed(dp) : String(minor));\n  const properties = { [P.stampStatus]: d.status, [P.stampReconciliationId]: calc.reconciliationId, [P.stampProcessedAt]: config.now };\n  if (P.stampAe) properties[P.stampAe] = asDec(sum('AE'));\n  if (P.stampSdr) properties[P.stampSdr] = asDec(sum('SDR'));\n  inputs.push({ id: d.dealId, properties });\n}\nif (!inputs.length) return [{ json: { skip: true, deals: 0 } }];\nconst out = [];\nfor (let i = 0; i < inputs.length; i += 100) {\n  out.push({ json: { skip: false, url: `${config.hubspot.apiBase}/crm/v3/objects/deals/batch/update`, body: { inputs: inputs.slice(i, i + 100) }, deals: Math.min(100, inputs.length - i) } });\n}\nreturn out;\n"
+      },
+      "id": "3df8d487-719e-4411-ab47-6e83bba1265c",
+      "name": "Build Deal Stamp Batches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3780,
+        -180
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "3f735beb-3443-42c2-a4a4-5faae4273abf",
+              "leftValue": "={{ $json.skip !== true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "f561001a-a4d9-4fc1-ab14-eea934442cd6",
+      "name": "Stamp Needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        4000,
+        -180
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "06227a9a-ce6a-49da-a968-acb0c5109ef2",
+      "name": "HubSpot: Batch Update Deals",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4220,
+        -300
+      ],
+      "notes": "The ONLY CRM write: clawback status, amounts, reconciliation ID, processed-at.",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Stamp Result\n// ============================================================================\nconst plan = $('Build Deal Stamp Batches').all().map((i) => i.json);\nconst exp = $('Export Result').first().json;\nif (plan.length === 1 && plan[0].skip) return [{ json: { ...exp, stamp: { attempted: false, stamped: 0, failed: 0, note: 'No deals to stamp' } } }];\nconst res = $input.all().map((i) => i.json);\nlet stamped = 0;\nlet failed = 0;\nconst errors = [];\nres.forEach((r, i) => {\n  if (r.error) { failed += plan[i] ? plan[i].deals : 0; errors.push(String(r.error.message || r.error).slice(0, 200)); return; }\n  stamped += (r.results || []).length;\n  for (const e of r.errors || []) { failed++; errors.push(String(e.message || e.category || 'error').slice(0, 200)); }\n});\nreturn [{ json: { ...exp, stamp: { attempted: true, stamped, failed, errors: errors.slice(0, 20) } } }];\n"
+      },
+      "id": "ad10e62a-1329-444e-a9a1-f8a03988a071",
+      "name": "Stamp Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4440,
+        -180
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Reconciliation Report  (terminal)\n// ============================================================================\nconst { config, safetyDecisions } = $('Config & Safety Gate').first().json;\nconst calc = $('Clawback Calculator').first().json;\nconst r = $input.first().json || {};\nlet status;\nif (r.mode === 'dry-run') status = 'DRY_RUN';\nelse if (r.stamp && r.stamp.failed) status = 'EXPORTED_STAMP_PARTIAL';\nelse if (r.stamp && r.stamp.attempted) status = 'EXPORTED_AND_STAMPED';\nelse status = 'EXPORTED';\nreturn [{\n  json: {\n    status,\n    reconciliationId: calc.reconciliationId,\n    period: calc.period,\n    mode: config.sandboxMode ? 'SANDBOX' : config.dryRun ? 'LIVE / DRY-RUN' : 'LIVE',\n    payrollCurrency: calc.payrollCurrency,\n    totals: calc.totals,\n    dealStatusCounts: calc.statusCounts,\n    rowStatusCounts: calc.rowStatusCounts,\n    guards: calc.guards,\n    pendingReview: calc.deals.filter((d) => d.status === 'PENDING_REVIEW').map((d) => ({ dealId: d.dealId, reasonCode: d.reasonCode })),\n    files: r.files || r.draftFiles || [],\n    exportBlockedBy: r.exportBlockedBy || [],\n    stampBlockedBy: r.mode === 'dry-run' ? r.stampBlockedBy : r.stamp ? [] : config.hubspot.stampBlockers,\n    stamp: r.stamp || null,\n    safetyDecisions,\n    configWarnings: config.warnings,\n    collectionWarnings: calc.collectionWarnings,\n  },\n}];\n"
+      },
+      "id": "8132796c-5f5f-48db-afd7-cb19ede21067",
+      "name": "Reconciliation Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4660,
+        120
+      ]
+    }
+  ],
+  "connections": {
+    "Manual Test Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config & Safety Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reconciliation Webhook": {
+      "main": [
+        [
+          {
+            "node": "Config & Safety Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Monthly Schedule (3rd, 04:23)": {
+      "main": [
+        [
+          {
+            "node": "Config & Safety Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config & Safety Gate": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Mode?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox Mode?": {
+      "main": [
+        [
+          {
+            "node": "Load Synthetic Churn Fixture",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Churned-Deal Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Synthetic Churn Fixture": {
+      "main": [
+        [
+          {
+            "node": "Normalize Deal Records",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Churned-Deal Search": {
+      "main": [
+        [
+          {
+            "node": "HubSpot: Search Churned Deals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot: Search Churned Deals": {
+      "main": [
+        [
+          {
+            "node": "Collect Search Pages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Search Pages": {
+      "main": [
+        [
+          {
+            "node": "Invoice Lookup Needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Invoice Lookup Needed?": {
+      "main": [
+        [
+          {
+            "node": "Build Invoice Association Requests",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Normalize Deal Records",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Invoice Association Requests": {
+      "main": [
+        [
+          {
+            "node": "HubSpot: Deal→Invoice Associations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot: Deal→Invoice Associations": {
+      "main": [
+        [
+          {
+            "node": "Build Invoice Read Requests",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Invoice Read Requests": {
+      "main": [
+        [
+          {
+            "node": "Invoice Reads Needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Invoice Reads Needed?": {
+      "main": [
+        [
+          {
+            "node": "HubSpot: Read Invoices",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Normalize Deal Records",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot: Read Invoices": {
+      "main": [
+        [
+          {
+            "node": "Normalize Deal Records",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Deal Records": {
+      "main": [
+        [
+          {
+            "node": "Clawback Calculator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clawback Calculator": {
+      "main": [
+        [
+          {
+            "node": "CSV Builder & Integrity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CSV Builder & Integrity": {
+      "main": [
+        [
+          {
+            "node": "Export Allowed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Export Allowed?": {
+      "main": [
+        [
+          {
+            "node": "Write CSV Files to Disk",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Dry-Run Preview",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dry-Run Preview": {
+      "main": [
+        [
+          {
+            "node": "Reconciliation Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write CSV Files to Disk": {
+      "main": [
+        [
+          {
+            "node": "Export Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Export Result": {
+      "main": [
+        [
+          {
+            "node": "HubSpot Stamp Allowed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot Stamp Allowed?": {
+      "main": [
+        [
+          {
+            "node": "Build Deal Stamp Batches",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reconciliation Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Deal Stamp Batches": {
+      "main": [
+        [
+          {
+            "node": "Stamp Needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stamp Needed?": {
+      "main": [
+        [
+          {
+            "node": "HubSpot: Batch Update Deals",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Stamp Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot: Batch Update Deals": {
+      "main": [
+        [
+          {
+            "node": "Stamp Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stamp Result": {
+      "main": [
+        [
+          {
+            "node": "Reconciliation Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}
