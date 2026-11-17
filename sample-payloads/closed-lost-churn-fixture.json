@@ -1,0 +1,58 @@
+{
+  "_meta": {
+    "synthetic": true,
+    "fixtureVersion": "1.0.0",
+    "description": "Fully synthetic HubSpot deal + invoice records for offline clawback testing. Every company, deal, owner ID, payroll reference and amount is fictional. No real employees, customers, bank or payroll details. Record shapes mirror HubSpot CRM v3 search results (id + properties) and invoice batch reads.",
+    "placeholderPortalId": "99000001",
+    "reconciliationPeriod": "2026-10",
+    "expectedWithDefaults": {
+      "990010001": "CLAWBACK day 21 (AE + SDR, linear 69/90)",
+      "990010002": "CLAWBACK day 60 (AE only, linear 30/90; deal name tests CSV formula-injection guard)",
+      "990010003": "CLAWBACK day 89 boundary (linear 1/90)",
+      "990010004": "Day 90 inclusive boundary: linear rate 0 -> BELOW_DE_MINIMIS",
+      "990010005": "OUTSIDE_WINDOW day 141",
+      "990010006": "CLAWBACK day 45, EUR -> USD via synthetic FX",
+      "990010007": "CLAWBACK day 10, JPY (zero-decimal currency) -> USD",
+      "990010008": "PENDING_REVIEW: CHF has no FX rate",
+      "990010009": "CLAWBACK day 46, churn detected from closed-lost stage move (no churn_date)",
+      "990010010": "EXEMPT (clawback_exempt=true)",
+      "990010011": "SKIP_ALREADY_RECONCILED (reconciliation ID already stamped)",
+      "990010012": "PENDING_REVIEW: malformed recorded commission",
+      "990010013": "PENDING_REVIEW: churn date before contract start",
+      "990010014": "PENDING_REVIEW: missing AE owner",
+      "990010015": "AE NO_COMMISSION_PAID + SDR CLAWBACK day 50; contract start stored as epoch ms",
+      "990010016": "AE CLAWBACK day 21; SDR PENDING_REVIEW (no recorded SDR commission)"
+    }
+  },
+  "portalId": "99000001",
+  "sandboxFx": { "payrollCurrency": "USD", "asOf": "2026-10-31", "rates": { "EUR": "1.08", "GBP": "1.27", "JPY": "0.0067" } },
+  "sandboxRepPayrollRefs": { "99100001": "EMP-SYN-0001", "99200001": "EMP-SYN-0101", "99200002": "EMP-SYN-0102" },
+  "deals": [
+    { "id": "990010001", "properties": { "hs_object_id": "990010001", "dealname": "Acme Enterprise Corp - Platform (Mock)", "amount": "95000", "deal_currency_code": "USD", "dealstage": "closedwon", "pipeline": "default", "closedate": "2026-09-05T16:00:00.000Z", "hs_date_entered_closedwon": "2026-09-05T16:00:00.000Z", "contract_start_date": "2026-09-10", "churn_date": "2026-10-01", "hubspot_owner_id": "99100001", "sdr_owner_id": "99200001", "ae_commission_paid": "9500.00", "sdr_commission_paid": "1900.00", "clawback_exempt": "false", "clawback_reconciliation_id": "" } },
+    { "id": "990010002", "properties": { "hs_object_id": "990010002", "dealname": "=HYPERLINK(\"https://example.com\",\"Northstar Renewal (Mock)\")", "amount": "60000.00", "deal_currency_code": "USD", "dealstage": "closedwon", "pipeline": "default", "closedate": "2026-08-10T16:00:00.000Z", "hs_date_entered_closedwon": "2026-08-10T16:00:00.000Z", "contract_start_date": "2026-08-12", "churn_date": "2026-10-11", "hubspot_owner_id": "99100002", "sdr_owner_id": "", "ae_commission_paid": "6000", "sdr_commission_paid": "" } },
+    { "id": "990010003", "properties": { "hs_object_id": "990010003", "dealname": "Bluebird Analytics - Pro (Mock)", "amount": "45000", "deal_currency_code": "USD", "dealstage": "closedwon", "closedate": "2026-07-14T16:00:00.000Z", "contract_start_date": "2026-07-15", "churn_date": "2026-10-12", "hubspot_owner_id": "99100001", "sdr_owner_id": "99200002", "ae_commission_paid": "4500", "sdr_commission_paid": "900" } },
+    { "id": "990010004", "properties": { "hs_object_id": "990010004", "dealname": "Pinecrest Media - Growth (Mock)", "amount": "30000", "deal_currency_code": "USD", "dealstage": "closedwon", "closedate": "2026-07-14T16:00:00.000Z", "contract_start_date": "2026-07-15", "churn_date": "2026-10-13", "hubspot_owner_id": "99100002", "ae_commission_paid": "3000" } },
+    { "id": "990010005", "properties": { "hs_object_id": "990010005", "dealname": "Harborview Freight - Enterprise (Mock)", "amount": "50000", "deal_currency_code": "USD", "dealstage": "closedwon", "closedate": "2026-05-29T16:00:00.000Z", "contract_start_date": "2026-06-01", "churn_date": "2026-10-20", "hubspot_owner_id": "99100001", "sdr_owner_id": "99200001", "ae_commission_paid": "5000", "sdr_commission_paid": "1000" } },
+    { "id": "990010006", "properties": { "hs_object_id": "990010006", "dealname": "Zurich Cafe Systems AG - POS (Mock)", "amount": "72000", "deal_currency_code": "EUR", "dealstage": "closedwon", "closedate": "2026-08-28T16:00:00.000Z", "contract_start_date": "2026-09-01", "churn_date": "2026-10-16", "hubspot_owner_id": "99100001", "sdr_owner_id": "99200002", "ae_commission_paid": "7200.00", "sdr_commission_paid": "1440.00" } },
+    { "id": "990010007", "properties": { "hs_object_id": "990010007", "dealname": "Sakura Logistics KK - Starter (Mock)", "amount": "3000000", "deal_currency_code": "JPY", "dealstage": "closedwon", "closedate": "2026-09-20T03:00:00.000Z", "contract_start_date": "2026-09-25", "churn_date": "2026-10-05", "hubspot_owner_id": "99100002", "ae_commission_paid": "300000" } },
+    { "id": "990010008", "properties": { "hs_object_id": "990010008", "dealname": "Alpine Ledger SA - Core (Mock)", "amount": "40000", "deal_currency_code": "CHF", "dealstage": "closedwon", "closedate": "2026-08-30T16:00:00.000Z", "contract_start_date": "2026-09-01", "churn_date": "2026-10-08", "hubspot_owner_id": "99100001", "ae_commission_paid": "4000" } },
+    { "id": "990010009", "properties": { "hs_object_id": "990010009", "dealname": "Granite Robotics - Pilot (Mock)", "amount": "25000", "deal_currency_code": "USD", "dealstage": "closedlost", "closedate": "2026-10-05T10:00:00.000Z", "hs_date_entered_closedwon": "2026-08-20T15:30:00.000Z", "hs_date_entered_closedlost": "2026-10-05T10:00:00.000Z", "contract_start_date": "", "churn_date": "", "hubspot_owner_id": "99100001", "sdr_owner_id": "99200001", "ae_commission_paid": "2500", "sdr_commission_paid": "500" } },
+    { "id": "990010010", "properties": { "hs_object_id": "990010010", "dealname": "Lakeside Health - Exempt (Mock)", "amount": "80000", "deal_currency_code": "USD", "dealstage": "closedwon", "closedate": "2026-09-01T16:00:00.000Z", "contract_start_date": "2026-09-02", "churn_date": "2026-10-03", "hubspot_owner_id": "99100002", "ae_commission_paid": "8000", "clawback_exempt": "true" } },
+    { "id": "990010011", "properties": { "hs_object_id": "990010011", "dealname": "Meridian Retail - Reconciled (Mock)", "amount": "20000", "deal_currency_code": "USD", "dealstage": "closedwon", "closedate": "2026-08-01T16:00:00.000Z", "contract_start_date": "2026-08-03", "churn_date": "2026-10-02", "hubspot_owner_id": "99100001", "ae_commission_paid": "2000", "clawback_reconciliation_id": "REC-2026-10-0000000000" } },
+    { "id": "990010012", "properties": { "hs_object_id": "990010012", "dealname": "Orbit Labs - Bad Data (Mock)", "amount": "12k", "deal_currency_code": "USD", "dealstage": "closedwon", "closedate": "2026-09-10T16:00:00.000Z", "contract_start_date": "2026-09-12", "churn_date": "2026-10-09", "hubspot_owner_id": "99100002", "ae_commission_paid": "9,5OO" } },
+    { "id": "990010013", "properties": { "hs_object_id": "990010013", "dealname": "Cobalt Systems - Date Error (Mock)", "amount": "15000", "deal_currency_code": "USD", "dealstage": "closedwon", "closedate": "2026-10-20T16:00:00.000Z", "contract_start_date": "2026-10-25", "churn_date": "2026-10-18", "hubspot_owner_id": "99100001", "ae_commission_paid": "1500" } },
+    { "id": "990010014", "properties": { "hs_object_id": "990010014", "dealname": "Ember Foods - No Owner (Mock)", "amount": "18000", "deal_currency_code": "USD", "dealstage": "closedwon", "closedate": "2026-09-15T16:00:00.000Z", "contract_start_date": "2026-09-15", "churn_date": "2026-10-10", "hubspot_owner_id": "", "ae_commission_paid": "1800" } },
+    { "id": "990010015", "properties": { "hs_object_id": "990010015", "dealname": "Quartz Mobility - SDR Only (Mock)", "amount": "20000", "deal_currency_code": "USD", "dealstage": "closedwon", "closedate": "2026-09-01T16:00:00.000Z", "contract_start_date": "1788393600000", "churn_date": "2026-10-23", "hubspot_owner_id": "99100002", "sdr_owner_id": "99200002", "ae_commission_paid": "0", "sdr_commission_paid": "400" } },
+    { "id": "990010016", "properties": { "hs_object_id": "990010016", "dealname": "Velvet Peak Apparel - Missing SDR (Mock)", "amount": "40000", "deal_currency_code": "USD", "dealstage": "closedwon", "closedate": "2026-09-08T16:00:00.000Z", "contract_start_date": "2026-09-10", "churn_date": "2026-10-01", "hubspot_owner_id": "99100001", "sdr_owner_id": "99200001", "ae_commission_paid": "4000", "sdr_commission_paid": "" } }
+  ],
+  "invoicesByDeal": {
+    "990010001": [
+      { "id": "990020001", "properties": { "hs_invoice_status": "paid", "hs_amount_billed": "23750.00", "hs_balance_due": "0", "hs_currency": "USD" } },
+      { "id": "990020002", "properties": { "hs_invoice_status": "open", "hs_amount_billed": "23750.00", "hs_balance_due": "23750.00", "hs_currency": "USD" } }
+    ],
+    "990010006": [
+      { "id": "990020003", "properties": { "hs_invoice_status": "paid", "hs_amount_billed": "18000.00", "hs_balance_due": "0", "hs_currency": "EUR" } },
+      { "id": "990020004", "properties": { "hs_invoice_status": "voided", "hs_amount_billed": "18000.00", "hs_balance_due": "18000.00", "hs_currency": "EUR" } }
+    ]
+  }
+}
