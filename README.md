@@ -33,6 +33,8 @@ It is **safe by default**. Imported as-is, it runs against a synthetic fixture (
 
 ## 1. Architecture overview
 
+![n8n HubSpot Commission Clawback & Churn Reconciliation Workflow Overview](./workflow-overview.png)
+
 ```mermaid
 flowchart LR
     subgraph T["Triggers"]
